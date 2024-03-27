@@ -1,6 +1,6 @@
+import os
 import time
 from log import log
-from sqlalchemy import text
 from database.db import get_session as dbconn
 from database import models
 from typing import List
@@ -10,7 +10,7 @@ from database.errors import (
     DatasetDoesNotExistError,
     FileDoesNotExistError,
 )
-from llama_index.vector_stores.postgres import PGVectorStore
+from llama_index.vector_stores.chroma import ChromaVectorStore
 
 
 from llama_index.core import Document
@@ -25,23 +25,21 @@ from llama_index.core import set_global_service_context, ServiceContext
 
 from llama_index.embeddings.openai import OpenAIEmbedding, OpenAIEmbeddingModelType
 from llama_index.llms.openai import OpenAI
+from llama_index.core.ingestion.cache import IngestionCache
+from llama_index.core.storage.kvstore.simple_kvstore import SimpleKVStore
 
 
 def dataset_exists(name: str) -> bool:
     c = dbconn()
-    n = f"data_{name}".lower()
-    x = c.execute(
-        text(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = :name)"
-        ),
-        {"name": n},
-    ).scalar()
+    name = name.lower()
+    # Check if the Datasets table has the dataset
+    x = c.get(models.Dataset, name)
     if not x:
         return False
     return True
 
 
-def get_vector_store(name: str, embed_dim: int = 1536) -> PGVectorStore:
+def get_vector_store(name: str, embed_dim: int = 1536) -> ChromaVectorStore:
     """Get a VectorStore for the given dataset name and embedding dimension
 
     Args:
@@ -51,14 +49,10 @@ def get_vector_store(name: str, embed_dim: int = 1536) -> PGVectorStore:
     Returns:
         PGVectorStore: VectorStore for the given dataset name and embedding dimension
     """
-    return PGVectorStore.from_params(
-        host=settings.db_host,
-        port=str(settings.db_port),
-        database=settings.db_dbname,
-        user=settings.db_user,
-        password=settings.db_password,
+    return ChromaVectorStore.from_params(
+        collection_name=name,
         embed_dim=embed_dim,
-        table_name=name,
+        persist_dir=settings.vector_store_dir,
     )
 
 
@@ -78,9 +72,15 @@ def create_dataset(name: str, embed_dim: int = 1536):
         raise DatasetExistsError(name)
 
     # Initialize VectorStore for the dataset
-    vector_store = get_vector_store(name, embed_dim=embed_dim)
-    if isinstance(vector_store, PGVectorStore):
-        vector_store._initialize()
+    _ = get_vector_store(name, embed_dim=embed_dim)
+
+    # Create the Dataset in the Datasets table
+    session = dbconn()
+    session.add(models.Dataset(name=name))
+    session.commit()
+    session.close()
+
+    log.info(f"Created dataset {name} with embedding dimension {embed_dim}")
 
 
 def delete_dataset(name: str):
@@ -98,20 +98,13 @@ def delete_dataset(name: str):
         raise DatasetDoesNotExistError(name)
 
     session = dbconn()
+
     # Drop Files and Documents
     session.query(models.FileIndex).filter(models.FileIndex.dataset == name).delete()
     session.query(models.DocumentIndex).filter(
         models.DocumentIndex.dataset == name
     ).delete()
-    session.commit()
-
-    # Drop the table
-    table_name = f"data_{name}".lower()
-    safe_table_name = (
-        text(table_name).compile(compile_kwargs={"literal_binds": True}).string
-    )
-    sql = f'DROP TABLE "{safe_table_name}"'
-    session.execute(text(sql))
+    session.query(models.Dataset).filter(models.Dataset.name == name).delete()
     session.commit()
     session.close()
 
@@ -166,19 +159,12 @@ async def ingest_documents(
     for doc in documents:
         doc.text = doc.text.replace("\x00", "")
 
-    from llama_index.core.ingestion.cache import IngestionCache
-    from llama_index.core.storage.kvstore.postgres_kvstore import PostgresKVStore
+    if os.path.exists(settings.cache_path):
+        kvstore = SimpleKVStore.from_persist_path(settings.cache_path)
+    else:
+        kvstore = SimpleKVStore()
 
-    cache = IngestionCache(
-        cache=PostgresKVStore.from_params(
-            host=settings.db_host,
-            port=str(settings.db_port),
-            database=settings.db_dbname,
-            user=settings.db_user,
-            password=settings.db_password,
-            table_name="ingestion_cache",
-        ),
-    )
+    cache = IngestionCache(cache=kvstore)
 
     pipeline = IngestionPipeline(
         transformations=transformations,
@@ -187,9 +173,6 @@ async def ingest_documents(
         cache=cache,
     )
 
-    # TODO: This is not being killed when we stop the server, so we need to fix this
-    # TODO: Replace either with a background task (FastAPI native) or a proper async task (Celery)
-    # TODO: Stream progress to the client
     pipeline_start_time = time.time()
     nodes = await pipeline.arun(documents=documents, show_progress=False, num_workers=1)
     pipeline_duration = time.time() - pipeline_start_time
@@ -198,11 +181,15 @@ async def ingest_documents(
     )
 
     start = time.time()
+    log.info(f"using api base {settings.api_base}")
+    log.info(f"[dataset={dataset}] Inserting {len(nodes)} nodes into the VectorStore")
     vector_store_index.insert_nodes(nodes)
     end = time.time() - start
     log.info(
-        f"[dataset={dataset}] Inserting {len(nodes)} nodes from {len(documents)} documents took {end:.2f} seconds"
+        f"[dataset={dataset}] Inserted {len(nodes)} nodes from {len(documents)} documents took {end:.2f} seconds"
     )
+
+    cache.persist(persist_path=settings.cache_path)
 
     return nodes
 
@@ -306,10 +293,6 @@ def get_dataset(dataset: str) -> dict[str, any]:
     response["num_files"] = len(files)
 
     for file in files:
-        file_item = {
-            "file_id": file.file_id,
-            "num_documents": len(file.documents),
-        }
         response["files"].append(
             {
                 "file_id": file.file_id,
@@ -330,14 +313,6 @@ def list_datasets() -> list[str]:
         list[str]: List of all available datasets
     """
     session = dbconn()
-    tables = session.execute(
-        text(
-            "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'data_%'"
-        )
-    ).all()
+    datasets = session.query(models.Dataset).all()
     session.close()
-    return [
-        str(table[0]).removeprefix("data_")
-        for table in tables
-        if table[0] not in ["data_type_privileges", "data_ingestion_cache"]
-    ]
+    return [dataset.name for dataset in datasets]

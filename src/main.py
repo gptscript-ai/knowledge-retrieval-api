@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -10,9 +11,28 @@ import traceback
 import uuid
 from typing import Optional
 from log import log
+from contextlib import asynccontextmanager
+import logging
+from database.db import migrate
+from config import settings
 
 
-app = FastAPI(title="Rubra - Knowledge Retrieval API")
+@asynccontextmanager
+async def lifespan(a: FastAPI):
+    os.makedirs(settings.data_dir, exist_ok=True)
+    os.makedirs(settings.cache_dir, exist_ok=True)
+    # DB Initialization & Migrations
+    try:
+        log.info("Running database migrations")
+        await migrate()
+    except Exception as e:
+        logging.error(f"Database migration failed: {e}\n{traceback.format_exc()}")
+    log.info("Database migrations completed")
+    yield
+    # Shutdown
+
+
+app = FastAPI(title="Rubra - Knowledge Retrieval API", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 
 
@@ -88,7 +108,7 @@ async def create_dataset(dataset: Dataset) -> Dataset:
     """Endpoint to create a new dataset in the VectorDB.
 
     Args:
-        name (str): Name of the dataset to create
+        dataset (str): Name of the dataset to create
 
     Raises:
         HTTPException: 409 Conflict if the dataset already exists
@@ -98,6 +118,7 @@ async def create_dataset(dataset: Dataset) -> Dataset:
         Dataset: Resulting dataset object
     """
     try:
+        log.info(f"Creating dataset '{dataset.name}'")
         dataset.name = dataset.name.lower()
         database.create_dataset(dataset.name)  # TODO: take embed_dim as input
         res = Dataset(name=dataset.name, embed_dim=1536)
@@ -314,6 +335,9 @@ def get_dataset(name: str):
 if __name__ == "__main__":
     import uvicorn
 
-    database.init_db()
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_config=os.path.join(os.path.dirname(__file__), "log_conf.yaml"),
+    )

@@ -21,7 +21,7 @@ if config.config_file_name is not None:
 
 config.set_main_option(
     "sqlalchemy.url",
-    f"postgresql+psycopg2://{settings.db_user}:{settings.db_password}@{settings.db_host}:{settings.db_port}/{settings.db_dbname}",
+    f"sqlite:///{settings.db_file_path}?check_same_thread=False",
 )
 
 
@@ -73,6 +73,8 @@ def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+
+    print(f"Running migrations on {connectable.url}")
 
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)

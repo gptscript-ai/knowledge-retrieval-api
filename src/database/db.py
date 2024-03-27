@@ -1,6 +1,9 @@
+import os
 from sqlalchemy import create_engine, Engine
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
-from sqlalchemy import URL
+from alembic import command
+from alembic.config import Config
 from config import settings
 
 engine: Engine | None = None
@@ -8,24 +11,22 @@ engine: Engine | None = None
 # Use scoped_session to ensure thread safety
 SessionLocal: scoped_session | None = None
 
-
 Base = declarative_base()
 
-db_url = URL.create(
-    drivername="postgresql+psycopg2",
-    host=settings.db_host,
-    port=settings.db_port,
-    username=settings.db_user,
-    password=settings.db_password,
-    database=settings.db_dbname,
-)
+# SQLite database URL
+db_url = f"sqlite:///{settings.db_file_path}"
+db_url_async = f"sqlite+aiosqlite:///{settings.db_file_path}"
 
 
 def get_engine():
     global engine
     if engine is None:
-        engine = create_engine(db_url, pool_pre_ping=True)
+        engine = create_engine(db_url, connect_args={"check_same_thread": False})
     return engine
+
+
+def get_async_engine():
+    return create_async_engine(db_url_async, echo=True)
 
 
 def get_session() -> scoped_session:
@@ -44,6 +45,24 @@ def get_session() -> scoped_session:
 from database.models import DocumentIndex, FileIndex  # noqa
 
 
-def init_db():
+async def init_db():
     """Initialize database"""
-    Base.metadata.create_all(bind=get_engine())
+    # await migrate()
+
+
+def run_upgrade(connection, cfg):
+    cfg.attributes["connection"] = connection
+    command.upgrade(cfg, "head")
+
+
+async def migrate():
+    """Run database migrations"""
+    eng = get_async_engine()
+    alembic_cfg = Config(settings.alembic_ini_path)
+    alembic_cfg.set_main_option(
+        "script_location", os.path.join(os.path.dirname(__file__), "../alembic")
+    )
+    alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+
+    async with eng.begin() as conn:
+        await conn.run_sync(run_upgrade, alembic_cfg)
